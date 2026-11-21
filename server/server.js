@@ -1,0 +1,18 @@
+import dotenv from 'dotenv';
+import express from 'express';
+import cors from 'cors';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+import api from './routes/api.js';
+import './database/db.js';
+const app=express();
+const serverDir=path.dirname(fileURLToPath(import.meta.url));
+dotenv.config({path:path.resolve(serverDir,'.env')});
+dotenv.config({path:path.resolve(serverDir,'../.env')});
+app.use(cors({origin:process.env.CLIENT_ORIGIN||'http://localhost:5173'}));
+app.use(express.json({limit:'1mb'}));
+app.use('/uploads',express.static(path.join(serverDir,'uploads')));
+app.use('/api',api);
+app.get('/api/health',(_req,res)=>res.json({ok:true}));
+app.use((err,_req,res,_next)=>{if(err instanceof SyntaxError)return res.status(400).json({error:'Invalid request.'});if(err.code==='LIMIT_FILE_SIZE')return res.status(400).json({error:'Image must be 5 MB or smaller.'});if(err.message?.toLowerCase().includes('file type'))return res.status(400).json({error:'Only JPEG, PNG and WebP images are accepted.'});console.error(err.message);res.status(500).json({error:'The request could not be completed.'});});
+const port=Number(process.env.PORT)||4000;app.listen(port,()=>console.log(`CivicPulse API listening on http://localhost:${port}`));

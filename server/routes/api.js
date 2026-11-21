@@ -1,0 +1,26 @@
+import { Router } from 'express';
+import multer from 'multer';
+import path from 'node:path';
+import fs from 'node:fs';
+import { fileURLToPath } from 'node:url';
+import { randomUUID } from 'node:crypto';
+import db, { transaction } from '../database/db.js';
+import { analyzeComplaint } from '../services/analysis.js';
+const router = Router();
+const serverDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+const uploadDir = path.join(serverDir, 'uploads');
+fs.mkdirSync(uploadDir,{recursive:true});
+const upload = multer({storage:multer.diskStorage({destination:uploadDir,filename:(_req,file,cb)=>cb(null,`${randomUUID()}${path.extname(file.originalname).toLowerCase()}`)}),limits:{fileSize:5*1024*1024},fileFilter:(_req,file,cb)=>['image/jpeg','image/png','image/webp'].includes(file.mimetype)?cb(null,true):cb(new Error('Unsupported file type'))});
+const statuses=['Pending','In Progress','Resolved'];
+const serialize = row => row && ({...row, image_url:row.image_path ? `/uploads/${path.basename(row.image_path)}` : null});
+router.post('/ai/analyze',async(req,res,next)=>{try{const {title,description}=req.body||{};if(typeof title!=='string'||!title.trim()||typeof description!=='string'||!description.trim())return res.status(400).json({error:'Title and description are required.'});res.json(await analyzeComplaint(title.trim(),description.trim()));}catch(e){next(e);}});
+router.post('/complaints',upload.single('image'),async(req,res,next)=>{try{const {title,description,location}=req.body||{};if(![title,description,location].every(v=>typeof v==='string'&&v.trim())){if(req.file)fs.unlinkSync(req.file.path);return res.status(400).json({error:'Title, description and location are required.'});}
+ const analysis=await analyzeComplaint(title.trim(),description.trim());const id=`CP-${new Date().getFullYear()}-${randomUUID().slice(0,8).toUpperCase()}`;const now=new Date().toISOString();const imagePath=req.file?.path||null;
+ transaction(()=>{db.prepare(`INSERT INTO complaints(id,title,description,location,image_path,category,severity,department,ai_summary,suggested_action,analysis_source,status,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,'Pending',?,?)`).run(id,title.trim(),description.trim(),location.trim(),imagePath,analysis.category,analysis.severity,analysis.department,analysis.summary,analysis.suggested_action,analysis.analysis_source,now,now);db.prepare('INSERT INTO complaint_history(complaint_id,previous_status,new_status,remarks,created_at) VALUES(?,NULL,?,?,?)').run(id,'Pending','Complaint submitted',now);});res.status(201).json({complaint:serialize(db.prepare('SELECT * FROM complaints WHERE id=?').get(id)),severity_reason:analysis.severity_reason});}catch(e){next(e);}});
+router.get('/complaints',(req,res,next)=>{try{const clauses=[],params=[];for(const key of ['category','severity','status'])if(req.query[key]){clauses.push(`${key}=?`);params.push(req.query[key]);}const q=clauses.length?` WHERE ${clauses.join(' AND ')}`:'';const rows=db.prepare(`SELECT * FROM complaints${q} ORDER BY created_at DESC`).all(...params);res.json(rows.map(serialize));}catch(e){next(e);}});
+router.get('/complaints/:id',(req,res)=>{const row=db.prepare('SELECT * FROM complaints WHERE id=?').get(req.params.id);row?res.json(serialize(row)):res.status(404).json({error:'Complaint not found.'});});
+router.get('/complaints/:id/history',(req,res)=>{if(!db.prepare('SELECT 1 FROM complaints WHERE id=?').get(req.params.id))return res.status(404).json({error:'Complaint not found.'});res.json(db.prepare('SELECT * FROM complaint_history WHERE complaint_id=? ORDER BY created_at DESC').all(req.params.id));});
+router.patch('/complaints/:id/status',(req,res)=>{const {status,remarks=''}=req.body||{};if(!statuses.includes(status))return res.status(400).json({error:'Status must be Pending, In Progress or Resolved.'});if(typeof remarks!=='string'||remarks.length>1000)return res.status(400).json({error:'Remarks must be 1000 characters or fewer.'});const current=db.prepare('SELECT * FROM complaints WHERE id=?').get(req.params.id);if(!current)return res.status(404).json({error:'Complaint not found.'});const now=new Date().toISOString();transaction(()=>{db.prepare('UPDATE complaints SET status=?,resolution_remarks=?,updated_at=? WHERE id=?').run(status,remarks.trim(),now,req.params.id);if(current.status!==status||remarks.trim())db.prepare('INSERT INTO complaint_history(complaint_id,previous_status,new_status,remarks,created_at) VALUES(?,?,?,?,?)').run(req.params.id,current.status,status,remarks.trim(),now);});res.json(serialize(db.prepare('SELECT * FROM complaints WHERE id=?').get(req.params.id)));});
+router.get('/dashboard/stats',(_req,res)=>{const counts=db.prepare("SELECT COUNT(*) total, SUM(status='Pending') pending, SUM(status='In Progress') in_progress, SUM(status='Resolved') resolved FROM complaints").get();const severity=db.prepare('SELECT severity,COUNT(*) count FROM complaints GROUP BY severity').all();res.json({total:counts.total,pending:counts.pending||0,in_progress:counts.in_progress||0,resolved:counts.resolved||0,severity});});
+router.get('/dashboard/categories',(_req,res)=>res.json(db.prepare('SELECT category,COUNT(*) count FROM complaints GROUP BY category ORDER BY count DESC,category').all()));
+export default router;
